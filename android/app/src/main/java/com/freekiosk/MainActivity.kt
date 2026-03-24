@@ -757,16 +757,16 @@ class MainActivity : ReactActivity() {
   /**
    * Handle ADB intent configuration
    * Allows setting up FreeKiosk via ADB commands:
-   * 
-   * First setup (no PIN configured):
+   *
+   * Single app lock:
    *   adb shell am start -n com.freekiosk/.MainActivity --es lock_package "com.app" --es pin "1234"
-   * 
-   * Modify existing config (PIN required):
-   *   adb shell am start -n com.freekiosk/.MainActivity --es lock_package "com.app" --es pin "1234"
-   * 
+   *
+   * Multi app lock (comma-separated, first package is primary/launched app):
+   *   adb shell am start -n com.freekiosk/.MainActivity --es lock_packages "com.app1,com.app2,com.app3" --es pin "1234"
+   *
    * Full config with URL:
    *   adb shell am start -n com.freekiosk/.MainActivity --es url "https://example.com" --es pin "1234"
-   * 
+   *
    * @return true if config was applied and app will restart, false otherwise
    */
   private fun handleAdbConfig(intent: Intent?): Boolean {
@@ -779,8 +779,10 @@ class MainActivity : ReactActivity() {
     val configJson = intent.getStringExtra("config") // Full JSON config
     val mqttBroker = intent.getStringExtra("mqtt_broker_url")
 
+    val lockPackages = intent.getStringExtra("lock_packages") // comma-separated: "com.app1,com.app2"
+
     // Skip if no config parameters
-    if (lockPackage == null && url == null && configJson == null && mqttBroker == null) return false
+    if (lockPackage == null && lockPackages == null && url == null && configJson == null && mqttBroker == null) return false
     
     android.util.Log.i("FreeKiosk-ADB", "ADB config received: lock_package=$lockPackage, url=$url, config=${configJson != null}")
     
@@ -845,6 +847,48 @@ class MainActivity : ReactActivity() {
     // Always include PIN in pending config so it's visible in Settings UI
     if (pin != null) {
       editor.putString("@kiosk_pin", pin)
+    }
+
+    if (lockPackages != null) {
+      // Multi-app lock: verify all packages, set first as primary, save all to managed apps
+      val packageList = lockPackages.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+      if (packageList.isEmpty()) {
+        android.util.Log.w("FreeKiosk-ADB", "lock_packages is empty")
+        showAdbToast("❌ ADB Config: lock_packages is empty")
+        return false
+      }
+
+      val verifiedPackages = mutableListOf<String>()
+      for (pkg in packageList) {
+        try {
+          packageManager.getPackageInfo(pkg, 0)
+          verifiedPackages.add(pkg)
+        } catch (e: Exception) {
+          android.util.Log.w("FreeKiosk-ADB", "Package not found: $pkg")
+          showAdbToast("❌ ADB Config: Package not found: $pkg")
+          return false
+        }
+      }
+
+      // First package becomes the primary launched app
+      editor.putString("@kiosk_external_app_package", verifiedPackages[0])
+      editor.putString("@kiosk_display_mode", "external_app")
+
+      // All packages go into managed apps JSON array (lock task whitelist)
+      val managedAppsJson = org.json.JSONArray()
+      for (pkg in verifiedPackages) {
+        val appObj = org.json.JSONObject()
+        appObj.put("packageName", pkg)
+        try {
+          val appInfo = packageManager.getApplicationInfo(pkg, 0)
+          appObj.put("appName", packageManager.getApplicationLabel(appInfo).toString())
+        } catch (e: Exception) {
+          appObj.put("appName", pkg)
+        }
+        managedAppsJson.put(appObj)
+      }
+      editor.putString("@kiosk_managed_apps", managedAppsJson.toString())
+      android.util.Log.i("FreeKiosk-ADB", "Multi-app lock: primary=${verifiedPackages[0]}, all=$verifiedPackages")
     }
 
     if (lockPackage != null) {
@@ -990,6 +1034,7 @@ class MainActivity : ReactActivity() {
     
     // Show success toast
     val configType = when {
+      lockPackages != null -> "apps: $lockPackages"
       lockPackage != null -> "app: $lockPackage"
       url != null -> "URL: $url"
       configJson != null -> "full config"
@@ -1154,6 +1199,32 @@ class MainActivity : ReactActivity() {
     // Handle lock_package -> also set display_mode
     if (config.has("lock_package") && !config.has("display_mode")) {
       editor.putString("@kiosk_display_mode", "external_app")
+    }
+
+    // Handle lock_packages JSON array -> multi-app lock
+    if (config.has("lock_packages")) {
+      try {
+        val pkgArray = config.getJSONArray("lock_packages")
+        if (pkgArray.length() > 0) {
+          val managedAppsJson = org.json.JSONArray()
+          for (i in 0 until pkgArray.length()) {
+            val pkg = pkgArray.getString(i).trim()
+            if (pkg.isNotEmpty()) {
+              val appObj = org.json.JSONObject()
+              appObj.put("packageName", pkg)
+              appObj.put("appName", pkg)
+              managedAppsJson.put(appObj)
+            }
+          }
+          editor.putString("@kiosk_external_app_package", pkgArray.getString(0).trim())
+          editor.putString("@kiosk_managed_apps", managedAppsJson.toString())
+          if (!config.has("display_mode")) {
+            editor.putString("@kiosk_display_mode", "external_app")
+          }
+        }
+      } catch (e: Exception) {
+        android.util.Log.w("FreeKiosk-ADB", "Invalid lock_packages array: ${e.message}")
+      }
     }
 
     // MQTT password requires special handling (goes to secure Keychain, not AsyncStorage)
